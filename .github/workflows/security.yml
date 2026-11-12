@@ -390,16 +390,25 @@ jobs:
           def esc(s):
               return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
-          def uses_values(node):
-              if isinstance(node, dict):
-                  for k, v in node.items():
-                      if k == "uses" and isinstance(v, str):
-                          yield v.strip()
-                      else:
-                          yield from uses_values(v)
-              elif isinstance(node, list):
-                  for v in node:
-                      yield from uses_values(v)
+          def uses_values(doc):
+              # Only the keys that select an action or reusable workflow:
+              # jobs.<id>.uses, jobs.<id>.steps[*].uses, and runs.steps[*].uses
+              # in an action.yml. A `uses` inside a step's `with:` is an input.
+              def step_uses(steps):
+                  for s in steps if isinstance(steps, list) else []:
+                      if isinstance(s, dict) and isinstance(s.get("uses"), str):
+                          yield s["uses"].strip()
+              if not isinstance(doc, dict):
+                  return
+              jobs = doc.get("jobs")
+              for job in (jobs.values() if isinstance(jobs, dict) else []):
+                  if isinstance(job, dict):
+                      if isinstance(job.get("uses"), str):
+                          yield job["uses"].strip()
+                      yield from step_uses(job.get("steps"))
+              runs = doc.get("runs")
+              if isinstance(runs, dict):
+                  yield from step_uses(runs.get("steps"))
 
           files = []
           for root, dirs, names in os.walk(".", followlinks=False):
@@ -721,5 +730,5 @@ jobs:
               const shown = absent.slice(0, 10).map(esc).join(", ");
               console.log(`::notice title=${T}::${absent.length} registry dependencies in the lockfile were not installed on this runner (usually optional packages for another platform), so their signatures were not verified here: ${shown}${absent.length > 10 ? ", ..." : ""}`);
             }
-            console.log(`${covered} installed registry dependencies covered by the signature check above; ${n} not from the registry ${prefix} (not covered); ${absent.length} not installed here (not checked)`);
+            console.log(`${covered} installed registry dependencies covered by the signature check above; ${n} not from the registry ${prefix} or missing an integrity hash (not covered); ${absent.length} not installed here (not checked)`);
           '
