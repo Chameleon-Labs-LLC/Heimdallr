@@ -1,6 +1,6 @@
 """AWS Monitor - LLM-powered AWS service monitoring and remediation."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from app.config import AppConfig
 from app.llm_client import LLMClient

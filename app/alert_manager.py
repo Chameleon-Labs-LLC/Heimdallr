@@ -28,6 +28,7 @@ class AlertStatus(Enum):
     ACKNOWLEDGED = "acknowledged"
     RESOLVED = "resolved"
     SUPPRESSED = "suppressed"
+    ESCALATION_EXHAUSTED = "escalation_exhausted"
 
 
 class AlertPriority(Enum):
@@ -57,6 +58,8 @@ class Alert:
     resolved_at: Optional[datetime] = None
     resolved_by: Optional[str] = None
     metadata: Dict = field(default_factory=dict)
+    escalation_count: int = 0
+    last_escalated_at: Optional[datetime] = None
 
     @classmethod
     def from_error(cls, error: DetectedError) -> "Alert":
@@ -140,8 +143,15 @@ class AlertManager:
     - Creates alerts from errors and health changes
     - Deduplicates alerts by fingerprint
     - Applies escalation rules based on priority and time
+    - Caps escalation attempts and backs off between them
     - Tracks alert lifecycle (open -> acknowledged -> resolved)
     """
+
+    # Stop notifying after this many escalation attempts.
+    MAX_ESCALATIONS = 10
+    # Minutes to wait before the next attempt, indexed by attempts already made.
+    # The last interval is reused until the attempt cap is reached.
+    ESCALATION_BACKOFF_MINUTES = (1, 2, 5, 10, 30)
 
     def __init__(
         self,
@@ -209,27 +219,84 @@ class AlertManager:
             await asyncio.sleep(60)  # Check every minute
 
     async def _check_escalations(self) -> None:
-        """Check open alerts against escalation rules."""
+        """Check open alerts against escalation rules.
+
+        An alert escalates at most once per backoff interval. When several
+        rules for its priority have passed their threshold, the one with the
+        longest threshold fires, so a later, stronger rule (for example a
+        page after a notify) takes over instead of being shadowed by the
+        first. After MAX_ESCALATIONS attempts the alert is marked
+        escalation_exhausted and a single error is logged.
+        """
         now = datetime.now(timezone.utc)
 
         for alert in list(self._alerts.values()):
             if alert.status != AlertStatus.OPEN:
                 continue
 
+            if alert.escalation_count >= self.MAX_ESCALATIONS:
+                self._mark_escalation_exhausted(alert, now)
+                continue
+
             age_minutes = (now - alert.created_at).total_seconds() / 60
 
-            for rule in self._escalation_rules:
-                if alert.priority == rule.priority and age_minutes >= rule.after_minutes:
-                    log.warning(
-                        f"Escalating alert {alert.alert_id}: "
-                        f"{rule.name} ({rule.action})"
-                    )
+            matching = [
+                rule for rule in self._escalation_rules
+                if rule.priority == alert.priority
+                and age_minutes >= rule.after_minutes
+            ]
+            if not matching or not self._escalation_interval_elapsed(alert, now):
+                continue
 
-                    if self.escalation_callback:
-                        try:
-                            self.escalation_callback(alert, rule.action)
-                        except Exception as e:
-                            log.error(f"Escalation callback failed: {e}")
+            rule = max(matching, key=lambda r: r.after_minutes)
+
+            alert.escalation_count += 1
+            alert.last_escalated_at = now
+            alert.updated_at = now
+
+            log.warning(
+                f"Escalating alert {alert.alert_id}: "
+                f"{rule.name} ({rule.action})"
+            )
+
+            if self.escalation_callback:
+                try:
+                    self.escalation_callback(alert, rule.action)
+                except Exception as e:
+                    log.error(f"Escalation callback failed: {e}")
+
+            if alert.escalation_count >= self.MAX_ESCALATIONS:
+                self._mark_escalation_exhausted(alert, now)
+
+    def _escalation_interval_elapsed(self, alert: Alert, now: datetime) -> bool:
+        """Return True when the backoff since the last escalation has elapsed."""
+        if alert.escalation_count == 0 or alert.last_escalated_at is None:
+            return True
+
+        index = min(
+            alert.escalation_count - 1,
+            len(self.ESCALATION_BACKOFF_MINUTES) - 1,
+        )
+        delay_minutes = self.ESCALATION_BACKOFF_MINUTES[index]
+        elapsed_minutes = (now - alert.last_escalated_at).total_seconds() / 60
+        return elapsed_minutes >= delay_minutes
+
+    def _mark_escalation_exhausted(self, alert: Alert, now: datetime) -> None:
+        """Stop further escalations and log the exhaustion a single time.
+
+        Only an OPEN alert can become exhausted. The escalation callback may
+        acknowledge or resolve the alert on its final attempt; that decision
+        stands and must not be overwritten here.
+        """
+        if alert.status != AlertStatus.OPEN:
+            return
+
+        alert.status = AlertStatus.ESCALATION_EXHAUSTED
+        alert.updated_at = now
+        log.error(
+            f"Alert {alert.alert_id} escalation exhausted after "
+            f"{alert.escalation_count} attempts"
+        )
 
     def process_error(self, error: DetectedError) -> Optional[Alert]:
         """Process a detected error and create/update alert.
@@ -428,7 +495,11 @@ class AlertManager:
         """
         alerts = [
             a for a in self._alerts.values()
-            if a.status in {AlertStatus.OPEN, AlertStatus.ACKNOWLEDGED}
+            if a.status in {
+                AlertStatus.OPEN,
+                AlertStatus.ACKNOWLEDGED,
+                AlertStatus.ESCALATION_EXHAUSTED,
+            }
         ]
 
         if priority:
@@ -484,7 +555,8 @@ class AlertManager:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         to_resolve = [
             a.fingerprint for a in self._alerts.values()
-            if a.status == AlertStatus.OPEN and a.created_at < cutoff
+            if a.status in {AlertStatus.OPEN, AlertStatus.ESCALATION_EXHAUSTED}
+            and a.created_at < cutoff
         ]
 
         for fp in to_resolve:
