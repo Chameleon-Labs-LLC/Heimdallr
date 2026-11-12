@@ -5,7 +5,10 @@
 litellm>=1.100.4
 
 # AWS SDK
-boto3>=1.43.125
+# boto3's floor must stay inside the newest aiobotocore's botocore pin
+# (aiobotocore 3.10.0: botocore>=1.43.115,<1.43.118). boto3 X.Y.Z needs
+# botocore>=X.Y.Z, so a higher floor makes this file unresolvable.
+boto3>=1.43.115
 aiobotocore>=2.26.0
 
 # Web Framework (for API)
