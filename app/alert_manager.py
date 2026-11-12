@@ -221,9 +221,12 @@ class AlertManager:
     async def _check_escalations(self) -> None:
         """Check open alerts against escalation rules.
 
-        Each matching rule fires at most once per backoff interval. After
-        MAX_ESCALATIONS attempts the alert is marked escalation_exhausted
-        and a single error is logged.
+        An alert escalates at most once per backoff interval. When several
+        rules for its priority have passed their threshold, the one with the
+        longest threshold fires, so a later, stronger rule (for example a
+        page after a notify) takes over instead of being shadowed by the
+        first. After MAX_ESCALATIONS attempts the alert is marked
+        escalation_exhausted and a single error is logged.
         """
         now = datetime.now(timezone.utc)
 
@@ -237,31 +240,33 @@ class AlertManager:
 
             age_minutes = (now - alert.created_at).total_seconds() / 60
 
-            for rule in self._escalation_rules:
-                if alert.priority != rule.priority or age_minutes < rule.after_minutes:
-                    continue
+            matching = [
+                rule for rule in self._escalation_rules
+                if rule.priority == alert.priority
+                and age_minutes >= rule.after_minutes
+            ]
+            if not matching or not self._escalation_interval_elapsed(alert, now):
+                continue
 
-                if not self._escalation_interval_elapsed(alert, now):
-                    break
+            rule = max(matching, key=lambda r: r.after_minutes)
 
-                alert.escalation_count += 1
-                alert.last_escalated_at = now
-                alert.updated_at = now
+            alert.escalation_count += 1
+            alert.last_escalated_at = now
+            alert.updated_at = now
 
-                log.warning(
-                    f"Escalating alert {alert.alert_id}: "
-                    f"{rule.name} ({rule.action})"
-                )
+            log.warning(
+                f"Escalating alert {alert.alert_id}: "
+                f"{rule.name} ({rule.action})"
+            )
 
-                if self.escalation_callback:
-                    try:
-                        self.escalation_callback(alert, rule.action)
-                    except Exception as e:
-                        log.error(f"Escalation callback failed: {e}")
+            if self.escalation_callback:
+                try:
+                    self.escalation_callback(alert, rule.action)
+                except Exception as e:
+                    log.error(f"Escalation callback failed: {e}")
 
-                if alert.escalation_count >= self.MAX_ESCALATIONS:
-                    self._mark_escalation_exhausted(alert, now)
-                break
+            if alert.escalation_count >= self.MAX_ESCALATIONS:
+                self._mark_escalation_exhausted(alert, now)
 
     def _escalation_interval_elapsed(self, alert: Alert, now: datetime) -> bool:
         """Return True when the backoff since the last escalation has elapsed."""
@@ -277,8 +282,13 @@ class AlertManager:
         return elapsed_minutes >= delay_minutes
 
     def _mark_escalation_exhausted(self, alert: Alert, now: datetime) -> None:
-        """Stop further escalations and log the exhaustion a single time."""
-        if alert.status == AlertStatus.ESCALATION_EXHAUSTED:
+        """Stop further escalations and log the exhaustion a single time.
+
+        Only an OPEN alert can become exhausted. The escalation callback may
+        acknowledge or resolve the alert on its final attempt; that decision
+        stands and must not be overwritten here.
+        """
+        if alert.status != AlertStatus.OPEN:
             return
 
         alert.status = AlertStatus.ESCALATION_EXHAUSTED
